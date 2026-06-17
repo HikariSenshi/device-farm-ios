@@ -1,3 +1,54 @@
+# device-farm-ios — ws-scrcpy fork (iOS 26 restoration)
+
+> Fork of [NetrisTV/ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy) that restores
+> its experimental **iOS** support on current macOS / **iOS 26**.
+>
+> ⚠️ **The iOS changes live on the [`fix/restore-ios-support`](https://github.com/HikariSenshi/device-farm-ios/tree/fix/restore-ios-support) branch — `git checkout fix/restore-ios-support` after cloning (`master` is not updated yet).**
+
+## Why this fork exists
+
+ws-scrcpy has experimental iOS screen mirroring, but on a modern Mac it was
+effectively broken: the video bridge it spawns ([ws-qvh](https://github.com/NetrisTV/ws-qvh))
+was built against a 2020 dependency snapshot whose `gousb v2.1.0+incompatible`
+panics (`libusb: unknown error [code -99]`), and a WebDriverAgent (touch-control)
+failure would crash the whole server. The result was a silent
+`[StreamReceiver] WS closed` with no obvious cause.
+
+This fork — together with the rebuilt
+[ws-qvh-renovation](https://github.com/HikariSenshi/ws-qvh-renovation) bridge — gets
+iOS video streaming working again on **iOS 26.5 / Apple Silicon macOS**, with
+multiple devices at once.
+
+## What this fork changes (server-side, `src/server/appl-device/`)
+
+- **A WebDriverAgent failure no longer crashes the server.** `WebDriverAgentProxy`
+  now handles the `WdaRunner` `error` event — the unhandled `emit('error')` used to
+  take down the whole Node process when WDA's `xcodebuild` failed.
+- **Configurable WDA code signing** via env (`WDA_TEAM_ID` / `WDA_SIGNING_ID` /
+  `WDA_BUNDLE_ID` / `WDA_USE_PREBUILT`) instead of hardcoded capabilities — needed to
+  sign WebDriverAgent for a real device.
+- **`WS_SCRCPY_DEBUG`** surfaces ws-qvh's own logs (device discovery, QuickTime
+  activation, `PING received`, libusb errors) and the QVH proxy wiring into the
+  server console (off by default).
+
+## Requires
+
+The rebuilt video bridge on `PATH`:
+**[ws-qvh-renovation](https://github.com/HikariSenshi/ws-qvh-renovation)** (upstream
+ws-qvh does not build on modern macOS). Build it, put `ws-qvh` on `PATH`, then run
+ws-scrcpy with `INCLUDE_APPL` enabled.
+
+## Status
+
+- **Video:** works (qvh → ws-qvh → ws-scrcpy), multi-device, iOS 26.5.
+- **Device control (WebDriverAgent):** in progress — migrating the in-process
+  `appium-xcuitest-driver@3.62` (2021) to a modern Appium server, since the current
+  driver dropped the embedding API this code relied on.
+
+---
+
+*Original upstream README follows.*
+
 # ws scrcpy
 
 Web client for [Genymobile/scrcpy][scrcpy] and more.
