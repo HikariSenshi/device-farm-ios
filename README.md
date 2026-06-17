@@ -2,6 +2,8 @@
 
 > Fork of [NetrisTV/ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy) that restores
 > its experimental **iOS** support on current macOS / **iOS 26**.
+>
+> ⚠️ **The iOS changes live on the [`fix/restore-ios-support`](https://github.com/HikariSenshi/device-farm-ios/tree/fix/restore-ios-support) branch — `git checkout fix/restore-ios-support` after cloning (`master` is not updated yet).**
 
 ## Why this fork exists
 
