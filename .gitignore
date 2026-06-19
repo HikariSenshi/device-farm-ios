@@ -2,3 +2,5 @@
 /dist
 /build
 /.idea
+/.appium-home
+/logs/

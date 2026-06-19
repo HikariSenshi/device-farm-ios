@@ -1,25 +1,38 @@
 import { ControlCenterCommand } from '../../../common/ControlCenterCommand';
 import { TypedEmitter } from '../../../common/TypedEmitter';
 import * as portfinder from 'portfinder';
-import { Server, XCUITestDriver } from '../../../types/WdaServer';
-import * as XCUITest from 'appium-xcuitest-driver';
 import { WDAMethod } from '../../../common/WDAMethod';
-import { timing } from 'appium-support';
 import { WdaStatus } from '../../../common/WdaStatus';
-
-const MJPEG_SERVER_PORT = 9100;
+import { AppiumRunner, requestJson } from './AppiumRunner';
 
 export interface WdaRunnerEvents {
     'status-change': { status: WdaStatus; text?: string; code?: number };
     error: Error;
 }
 
+// Creating a session may build/launch WebDriverAgent on the device — slow on the first run.
+const SESSION_CREATE_TIMEOUT = 300000;
+const COMMAND_TIMEOUT = 30000;
+// Duration (seconds) used to turn a SCROLL gesture into a WDA drag.
+const SCROLL_DURATION_SEC = 0.5;
+
+/**
+ * Per-device WebDriverAgent control.
+ *
+ * Was: an in-process embedding of the bundled `appium-xcuitest-driver@3.62.0`.
+ * Now: a thin HTTP (W3C WebDriver) client of a modern, standalone Appium server
+ * (see {@link AppiumRunner}). One Appium server hosts many sessions; this class
+ * owns exactly one session per device (udid).
+ *
+ * The WebSocket protocol with the browser (`WDAMethod`, the response envelope and
+ * the `status-change` / `error` events) is intentionally unchanged.
+ */
 export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
     protected static TAG = 'WDARunner';
     private static instances: Map<string, WdaRunner> = new Map();
     public static SHUTDOWN_TIMEOUT = 15000;
-    private static servers: Map<string, Server> = new Map();
-    private static cachedScreenWidth: Map<string, any> = new Map();
+    private static cachedScreenWidth: Map<string, number> = new Map();
+
     public static getInstance(udid: string): WdaRunner {
         let instance = this.instances.get(udid);
         if (!instance) {
@@ -29,48 +42,12 @@ export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
         instance.lock();
         return instance;
     }
-    public static async getServer(udid: string): Promise<Server> {
-        let server = this.servers.get(udid);
-        if (!server) {
-            const port = await portfinder.getPortPromise();
-            server = await XCUITest.startServer(port, '127.0.0.1');
-            server.on('error', (...args: any[]) => {
-                console.error('Server Error:', args);
-            });
-            server.on('close', (...args: any[]) => {
-                console.error('Server Close:', args);
-            });
-            this.servers.set(udid, server);
-        }
-        return server;
-    }
-
-    public static async getScreenWidth(udid: string, driver: XCUITestDriver): Promise<number> {
-        const cached = this.cachedScreenWidth.get(udid);
-        if (cached) {
-            return cached;
-        }
-        const info = await driver.getScreenInfo();
-        if (info && info.statusBarSize.width > 0) {
-            const screenWidth = info.statusBarSize.width;
-            this.cachedScreenWidth.set(udid, screenWidth);
-            return screenWidth;
-        }
-        const el = await driver.findElement('xpath', '//XCUIElementTypeApplication');
-        const size = await driver.getSize(el);
-        if (size) {
-            const screenWidth = size.width;
-            this.cachedScreenWidth.set(udid, screenWidth);
-            return screenWidth;
-        }
-        return 0;
-    }
 
     protected name: string;
     protected started = false;
     protected starting = false;
-    private server?: Server;
-    private mjpegServerPort = 0;
+    private baseUrl?: string;
+    private sessionId?: string;
     private wdaLocalPort = 0;
     private holders = 0;
     protected releaseTimeoutId?: NodeJS.Timeout;
@@ -83,6 +60,7 @@ export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
     protected lock(): void {
         if (this.releaseTimeoutId) {
             clearTimeout(this.releaseTimeoutId);
+            this.releaseTimeoutId = undefined;
         }
         this.holders++;
     }
@@ -92,50 +70,47 @@ export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
         if (this.holders > 0) {
             return;
         }
-        this.releaseTimeoutId = setTimeout(async () => {
-            WdaRunner.servers.delete(this.udid);
+        this.releaseTimeoutId = setTimeout(() => {
             WdaRunner.instances.delete(this.udid);
-            if (this.server) {
-                if (this.server.driver) {
-                    await this.server.driver.deleteSession();
-                }
-                this.server.close();
-                delete this.server;
-            }
+            void this.deleteSession();
         }, WdaRunner.SHUTDOWN_TIMEOUT);
     }
 
+    // MJPEG video path is no longer served through WDA (video comes from qvh).
+    // Kept as a no-op for source compatibility with the (build-time disabled)
+    // MjpegProxyFactory.
     public get mjpegPort(): number {
-        return this.mjpegServerPort;
+        return 0;
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     public async request(command: ControlCenterCommand): Promise<any> {
-        const driver = this.server?.driver;
-        if (!driver) {
+        if (!this.sessionId || !this.baseUrl) {
             return;
         }
-
         const method = command.getMethod();
         const args = command.getArgs();
         switch (method) {
             case WDAMethod.GET_SCREEN_WIDTH:
-                return WdaRunner.getScreenWidth(this.udid, driver);
+                return this.getScreenWidth();
             case WDAMethod.CLICK:
-                return driver.performTouch([{ action: 'tap', options: { x: args.x, y: args.y } }]);
+                return this.executeMobile('mobile: tap', { x: args.x, y: args.y });
             case WDAMethod.PRESS_BUTTON:
-                return driver.mobilePressButton({ name: args.name });
+                return this.executeMobile('mobile: pressButton', { name: args.name });
             case WDAMethod.SCROLL:
-                const { from, to } = args;
-                return driver.performTouch([
-                    { action: 'press', options: { x: from.x, y: from.y } },
-                    { action: 'wait', options: { ms: 500 } },
-                    { action: 'moveTo', options: { x: to.x, y: to.y } },
-                    { action: 'release', options: {} },
-                ]);
+                return this.executeMobile('mobile: dragFromToForDuration', {
+                    duration: SCROLL_DURATION_SEC,
+                    fromX: args.from.x,
+                    fromY: args.from.y,
+                    toX: args.to.x,
+                    toY: args.to.y,
+                });
             case WDAMethod.APPIUM_SETTINGS:
-                return driver.updateSettings(args.options);
+                return this.updateSettings(args.options);
             case WDAMethod.SEND_KEYS:
-                return driver.keys(args.keys);
+                return this.executeMobile('mobile: keys', {
+                    keys: Array.isArray(args.keys) ? args.keys : [args.keys],
+                });
             default:
                 return `Unknown command: ${method}`;
         }
@@ -145,58 +120,33 @@ export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
         if (this.started || this.starting) {
             return;
         }
-        this.emit('status-change', { status: WdaStatus.STARTING });
         this.starting = true;
-        const server = await WdaRunner.getServer(this.udid);
+        this.emit('status-change', { status: WdaStatus.STARTING });
         try {
-            const remoteMjpegServerPort = MJPEG_SERVER_PORT;
-            const ports = await Promise.all([portfinder.getPortPromise(), portfinder.getPortPromise()]);
-            this.wdaLocalPort = ports[0];
-            this.mjpegServerPort = ports[1];
-            await server.driver.createSession({
-                platformName: 'iOS',
-                deviceName: 'my iphone',
-                udid: this.udid,
-                wdaLocalPort: this.wdaLocalPort,
-                usePrebuiltWDA: true,
-                mjpegServerPort: remoteMjpegServerPort,
-            });
-            await server.driver.wda.xcodebuild.waitForStart(new timing.Timer().start());
-            if (server.driver?.wda?.xcodebuild?.xcodebuild) {
-                server.driver.wda.xcodebuild.xcodebuild.on('exit', (code: number) => {
-                    this.started = false;
-                    this.starting = false;
-                    server.driver.deleteSession();
-                    delete this.server;
-                    this.emit('status-change', { status: WdaStatus.STOPPED, code });
-                    if (this.holders > 0) {
-                        this.start();
-                    }
-                });
-            } else {
-                this.started = false;
-                this.starting = false;
-                delete this.server;
-                throw new Error('xcodebuild process not found');
-            }
-            /// #if USE_WDA_MJPEG_SERVER
-            const { DEVICE_CONNECTIONS_FACTORY } = await import(
-                'appium-xcuitest-driver/build/lib/device-connections-factory'
+            this.baseUrl = await AppiumRunner.getInstance().whenReady();
+            this.wdaLocalPort = await portfinder.getPortPromise();
+            const capabilities = this.buildCapabilities();
+            const { status, body } = await requestJson(
+                'POST',
+                `${this.baseUrl}/session`,
+                { capabilities },
+                SESSION_CREATE_TIMEOUT,
             );
-
-            await DEVICE_CONNECTIONS_FACTORY.requestConnection(this.udid, this.mjpegServerPort, {
-                usePortForwarding: true,
-                devicePort: remoteMjpegServerPort,
-            });
-            /// #endif
+            const sessionId = body && body.value && body.value.sessionId;
+            if (status < 200 || status >= 300 || !sessionId) {
+                const message =
+                    (body && body.value && body.value.message) || `Failed to create session (HTTP ${status})`;
+                throw new Error(message);
+            }
+            this.sessionId = sessionId;
             this.started = true;
+            this.starting = false;
             this.emit('status-change', { status: WdaStatus.STARTED });
-        } catch (error: any) {
+        } catch (error) {
             this.started = false;
             this.starting = false;
-            this.emit('error', error);
+            this.emit('error', error instanceof Error ? error : new Error(String(error)));
         }
-        this.server = server;
     }
 
     public isStarted(): boolean {
@@ -205,5 +155,142 @@ export class WdaRunner extends TypedEmitter<WdaRunnerEvents> {
 
     public release(): void {
         this.unlock();
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private buildCapabilities(): any {
+        const xcodeOrgId = process.env.WDA_TEAM_ID;
+        const xcodeSigningId = process.env.WDA_SIGNING_ID || 'Apple Development';
+        const updatedWDABundleId = process.env.WDA_BUNDLE_ID;
+        const usePrebuiltWDA = process.env.WDA_USE_PREBUILT === 'true';
+        // Real-device WebDriverAgent signing is configured via env so we don't hardcode a
+        // developer identity (xcodebuild fails with code 65 when WDA is unsigned):
+        //   WDA_TEAM_ID    - Apple Team ID (the cert's OU, e.g. 5GD582Y7Q3)
+        //   WDA_SIGNING_ID - signing identity, default "Apple Development"
+        //   WDA_BUNDLE_ID  - unique WDA bundle id, e.g. com.<you>.WebDriverAgentRunner
+        //   WDA_USE_PREBUILT=true - reuse an already-built+signed WDA (faster)
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const alwaysMatch: any = {
+            platformName: 'iOS',
+            'appium:automationName': 'XCUITest',
+            'appium:udid': this.udid,
+            'appium:wdaLocalPort': this.wdaLocalPort,
+            'appium:usePrebuiltWDA': usePrebuiltWDA,
+            'appium:allowProvisioningDeviceRegistration': true,
+            'appium:wdaLaunchTimeout': 240000,
+            'appium:newCommandTimeout': 300,
+        };
+        if (xcodeOrgId) {
+            alwaysMatch['appium:xcodeOrgId'] = xcodeOrgId;
+            alwaysMatch['appium:xcodeSigningId'] = xcodeSigningId;
+        }
+        if (updatedWDABundleId) {
+            alwaysMatch['appium:updatedWDABundleId'] = updatedWDABundleId;
+        }
+        if (process.env.WS_SCRCPY_DEBUG) {
+            alwaysMatch['appium:showXcodeLog'] = true;
+        }
+        // Optional: silences the "'platformVersion' ('undefined') is not a valid version"
+        // warning and avoids version-dependent driver inconsistencies (e.g. WDA_PLATFORM_VERSION=26.5).
+        if (process.env.WDA_PLATFORM_VERSION) {
+            alwaysMatch['appium:platformVersion'] = process.env.WDA_PLATFORM_VERSION;
+        }
+        return { alwaysMatch, firstMatch: [{}] };
+    }
+
+    private sessionUrl(suffix = ''): string {
+        return `${this.baseUrl}/session/${this.sessionId}${suffix}`;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private async executeMobile(script: string, args: Record<string, unknown>): Promise<any> {
+        const { status, body } = await requestJson(
+            'POST',
+            this.sessionUrl('/execute/sync'),
+            { script, args: [args] },
+            COMMAND_TIMEOUT,
+        );
+        return this.unwrap(status, body);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private async updateSettings(settings: Record<string, unknown>): Promise<any> {
+        const { status, body } = await requestJson(
+            'POST',
+            this.sessionUrl('/appium/settings'),
+            { settings },
+            COMMAND_TIMEOUT,
+        );
+        return this.unwrap(status, body);
+    }
+
+    private async getScreenWidth(): Promise<number> {
+        const cached = WdaRunner.cachedScreenWidth.get(this.udid);
+        if (cached) {
+            return cached;
+        }
+        let width = 0;
+        try {
+            // `mobile: deviceScreenInfo` maps to the same getScreenInfo() the old driver used.
+            const info = await this.executeMobile('mobile: deviceScreenInfo', {});
+            if (info && info.statusBarSize && info.statusBarSize.width > 0) {
+                width = info.statusBarSize.width;
+            }
+        } catch (e) {
+            /* fall back to the window rect below */
+        }
+        if (!width) {
+            const { status, body } = await requestJson(
+                'GET',
+                this.sessionUrl('/window/rect'),
+                undefined,
+                COMMAND_TIMEOUT,
+            );
+            const rect = this.unwrap(status, body);
+            if (rect && rect.width) {
+                width = rect.width;
+            }
+        }
+        if (width) {
+            WdaRunner.cachedScreenWidth.set(this.udid, width);
+        }
+        return width;
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    private unwrap(status: number, body: any): any {
+        if (status >= 200 && status < 300) {
+            return body ? body.value : undefined;
+        }
+        const value = (body && body.value) || {};
+        if (status === 404 || value.error === 'invalid session id') {
+            this.onSessionLost();
+        }
+        throw new Error(value.message || `HTTP ${status}`);
+    }
+
+    private onSessionLost(): void {
+        this.sessionId = undefined;
+        this.started = false;
+        WdaRunner.cachedScreenWidth.delete(this.udid);
+        this.emit('status-change', { status: WdaStatus.STOPPED });
+        if (this.holders > 0) {
+            void this.start();
+        }
+    }
+
+    private async deleteSession(): Promise<void> {
+        const sessionId = this.sessionId;
+        const baseUrl = this.baseUrl;
+        this.sessionId = undefined;
+        this.started = false;
+        this.starting = false;
+        if (sessionId && baseUrl) {
+            try {
+                await requestJson('DELETE', `${baseUrl}/session/${sessionId}`, undefined, COMMAND_TIMEOUT);
+            } catch (e) {
+                /* best-effort cleanup */
+            }
+        }
     }
 }

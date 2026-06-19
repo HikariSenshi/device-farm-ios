@@ -52,10 +52,21 @@ export class WebDriverAgentProxy extends Mw {
         this.wda.on('status-change', ({ status, code, text }) => {
             this.onStatusChange(command, status, code, text);
         });
+        // WdaRunner emits 'error' when WebDriverAgent fails to launch (e.g. xcodebuild
+        // signing failure, code 65). Without an 'error' listener Node's EventEmitter
+        // re-throws it and crashes the whole server. Handle it: keep the stream alive,
+        // just report that control is unavailable.
+        this.wda.on('error', (error: Error) => {
+            console.error(`${this.name}, WDA failed to start: ${error.message}`);
+            this.onStatusChange(command, WdaStatus.STOPPED, -1, error.message);
+        });
         if (this.wda.isStarted()) {
             this.onStatusChange(command, WdaStatus.STARTED);
         } else {
-            this.wda.start();
+            this.wda.start().catch((error: Error) => {
+                console.error(`${this.name}, WDA start rejected: ${error.message}`);
+                this.onStatusChange(command, WdaStatus.STOPPED, -1, error.message);
+            });
         }
     }
 

@@ -35,6 +35,9 @@ export class QVHStreamProxy extends Mw {
 
     private onStarted = (): void => {
         const remote = this.qvhProcess.getWebSocketAddress();
+        if (process.env.WS_SCRCPY_DEBUG) {
+            console.log(`${this.name} ws-qvh started, proxying client → ${remote}`);
+        }
         this.wsProxy = WebsocketProxy.createProxy(this.ws, remote);
         this.ws.addEventListener('close', this.onSocketClose.bind(this));
     };

@@ -59,6 +59,13 @@ export class QvhackRunner extends ProcessRunner<ProcessRunnerEvents> {
     public async start(): Promise<void> {
         return this.runProcess()
             .then(() => {
+                // With WS_SCRCPY_DEBUG set, surface ws-qvh's own logs (device discovery,
+                // QT activation, "PING received", libusb/USB errors) into the ws-scrcpy
+                // console. Otherwise this output is swallowed and stream failures are silent.
+                if (process.env.WS_SCRCPY_DEBUG) {
+                    this.on('stdout', (data) => process.stdout.write(`${this.name}[ws-qvh] ${data}`));
+                    this.on('stderr', (data) => process.stderr.write(`${this.name}[ws-qvh] ${String(data)}`));
+                }
                 // Wait for server to start listen on a port
                 this.once('stderr', () => {
                     this.started = true;

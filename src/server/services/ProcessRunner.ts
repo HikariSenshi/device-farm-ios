@@ -18,6 +18,11 @@ export abstract class ProcessRunner<T extends ProcessRunnerEvents> extends Typed
     protected name: string;
     protected cmd = '';
     protected spawned = false;
+    // When true the child is spawned as its own process-group leader so the whole
+    // subtree (e.g. appium + xcodebuild) can be signalled at once via a negative pid.
+    protected detached = false;
+    // Custom environment for the child. When undefined the child inherits process.env.
+    protected env?: NodeJS.ProcessEnv;
     protected proc?: ChildProcessByStdio<Writable, Readable, Readable>;
     protected constructor() {
         super();
@@ -31,7 +36,11 @@ export abstract class ProcessRunner<T extends ProcessRunnerEvents> extends Typed
             throw new Error('Empty command');
         }
         const args = await this.getArgs();
-        this.proc = spawn(this.cmd, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+        this.proc = spawn(this.cmd, args, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            detached: this.detached,
+            env: this.env,
+        });
 
         this.proc.stdout.on('data', (data) => {
             this.emit('stdout', data.toString());
