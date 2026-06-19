@@ -1,49 +1,59 @@
 # device-farm-ios — ws-scrcpy fork (iOS 26 restoration)
 
 > Fork of [NetrisTV/ws-scrcpy](https://github.com/NetrisTV/ws-scrcpy) that restores
-> its experimental **iOS** support on current macOS / **iOS 26**.
+> its experimental **iOS** support on current macOS / **iOS 26** — both screen
+> mirroring **and** device control.
 >
-> ⚠️ **The iOS changes live on the [`fix/restore-ios-support`](https://github.com/HikariSenshi/device-farm-ios/tree/fix/restore-ios-support) branch — `git checkout fix/restore-ios-support` after cloning (`master` is not updated yet).**
+> ⚠️ **The iOS restoration code lives on the [`fix/restore-ios-support`](https://github.com/LWHikarik/device-farm-ios/tree/fix/restore-ios-support) branch — `git checkout fix/restore-ios-support` after cloning. `master` carries this overview and tracks upstream.**
 
 ## Why this fork exists
 
-ws-scrcpy has experimental iOS screen mirroring, but on a modern Mac it was
-effectively broken: the video bridge it spawns ([ws-qvh](https://github.com/NetrisTV/ws-qvh))
-was built against a 2020 dependency snapshot whose `gousb v2.1.0+incompatible`
-panics (`libusb: unknown error [code -99]`), and a WebDriverAgent (touch-control)
-failure would crash the whole server. The result was a silent
-`[StreamReceiver] WS closed` with no obvious cause.
+ws-scrcpy has experimental iOS support, but on a modern Mac it was effectively
+broken on two fronts:
 
-This fork — together with the rebuilt
-[ws-qvh-renovation](https://github.com/HikariSenshi/ws-qvh-renovation) bridge — gets
-iOS video streaming working again on **iOS 26.5 / Apple Silicon macOS**, with
-multiple devices at once.
+- **Video.** The bridge it spawns ([ws-qvh](https://github.com/NetrisTV/ws-qvh)) was
+  built against a 2020 dependency snapshot whose `gousb v2.1.0+incompatible` panics
+  on modern libusb (`libusb: unknown error [code -99]`).
+- **Control.** Touch control relied on a 2021 in-process `appium-xcuitest-driver@3.62`,
+  whose embedding API (`startServer` / `performTouch`) no longer exists in modern
+  XCUITest, and a WebDriverAgent failure would crash the whole Node server.
+
+The visible symptom was a silent `[StreamReceiver] WS closed` (and a server crash on
+the first touch) with no obvious cause. This fork gets **both** working again on
+**iOS 26.5 / Apple Silicon macOS**, with multiple devices at once.
 
 ## What this fork changes (server-side, `src/server/appl-device/`)
 
+- **Device control restored on modern iOS.** The in-process 2021
+  `appium-xcuitest-driver` is replaced by a **modern, bundled Appium driven over
+  HTTP** (W3C WebDriver / `mobile:` commands). ws-scrcpy spawns and supervises Appium
+  as a child process, and a `postinstall` step pins the XCUITest driver into a
+  project-local `.appium-home` — **no global Appium install required**. Tap, scroll
+  and Home work on **iOS 26.5**.
 - **A WebDriverAgent failure no longer crashes the server.** `WebDriverAgentProxy`
   now handles the `WdaRunner` `error` event — the unhandled `emit('error')` used to
   take down the whole Node process when WDA's `xcodebuild` failed.
-- **Configurable WDA code signing** via env (`WDA_TEAM_ID` / `WDA_SIGNING_ID` /
-  `WDA_BUNDLE_ID` / `WDA_USE_PREBUILT`) instead of hardcoded capabilities — needed to
-  sign WebDriverAgent for a real device.
-- **`WS_SCRCPY_DEBUG`** surfaces ws-qvh's own logs (device discovery, QuickTime
-  activation, `PING received`, libusb errors) and the QVH proxy wiring into the
-  server console (off by default).
+- **Configurable WDA code signing & logging via env**
+  (`WDA_TEAM_ID` / `WDA_SIGNING_ID` / `WDA_BUNDLE_ID` / `WDA_PLATFORM_VERSION` /
+  `WDA_USE_PREBUILT`, and `WS_SCRCPY_DEBUG` for verbose Appium / ws-qvh logs) instead
+  of hardcoded capabilities — needed to sign WebDriverAgent for a real device.
 
 ## Requires
 
-The rebuilt video bridge on `PATH`:
-**[ws-qvh-renovation](https://github.com/HikariSenshi/ws-qvh-renovation)** (upstream
-ws-qvh does not build on modern macOS). Build it, put `ws-qvh` on `PATH`, then run
-ws-scrcpy with `INCLUDE_APPL` enabled.
+The [ws-qvh](https://github.com/NetrisTV/ws-qvh) video bridge on `PATH`. The fix that
+makes it build on modern macOS is now **merged upstream**, so build it straight from
+[NetrisTV/ws-qvh](https://github.com/NetrisTV/ws-qvh) (the old `ws-qvh-renovation` fork
+is no longer needed). Then run ws-scrcpy with `INCLUDE_APPL` enabled. See the **iOS**
+section below for the one-time WebDriverAgent setup.
 
 ## Status
 
 - **Video:** works (qvh → ws-qvh → ws-scrcpy), multi-device, iOS 26.5.
-- **Device control (WebDriverAgent):** in progress — migrating the in-process
-  `appium-xcuitest-driver@3.62` (2021) to a modern Appium server, since the current
-  driver dropped the embedding API this code relied on.
+- **Device control (WebDriverAgent):** works on iOS 26.5 — tap, scroll/swipe and Home
+  — validated on a real device via a bundled modern Appium. Upstreaming to
+  NetrisTV/ws-scrcpy is in progress.
+- **Temporarily suspended:** the WDA-MJPEG video path (qvh is used for video instead);
+  see the iOS section / Known issues below.
 
 ---
 
@@ -163,7 +173,17 @@ Control your device from `adb shell` in your browser.
 
 Requires [ws-qvh][ws-qvh] available in `PATH`.
 
+Tips for a stable QuickTime-over-USB stream: set the device's **Auto-Lock to
+Never** (a locked screen stops the stream), connect the iPhone **directly**
+(no USB hub), and do not run a standalone `ws-qvh`/`qvh` capture against the
+same device while ws-scrcpy is streaming — only one process may hold a device.
+
 #### MJPEG Server
+
+> ⚠️ **Temporarily suspended.** After the migration to a standalone Appium
+> (see [Remote control](#remote-control)) the WDA-MJPEG video path is not wired
+> up and is planned to be restored in a follow-up. iOS screen casting currently
+> runs via `ws-qvh` (see above).
 
 Enable `USE_WDA_MJPEG_SERVER` in the build configuration file
 (see [custom build](#custom-build)).
@@ -174,16 +194,59 @@ frame encoded as jpeg image.
 
 #### Remote control
 
-To control device we use [appium/WebDriverAgent][WebDriverAgent].
-Functionality limited to:
+Device control is provided by [appium/WebDriverAgent][WebDriverAgent], driven
+through a modern [Appium][appium] server over the W3C WebDriver protocol.
+ws-scrcpy bundles Appium (it is a dependency, and a `postinstall` step pins the
+XCUITest driver into a project-local `.appium-home`), spawns it as a child
+process on startup, and forwards control commands to it over HTTP — no global
+Appium installation is required.
+
+Supported actions:
 * Simple touch
-* Scroll
+* Scroll / swipe
 * Home button click
 
-Make sure you did properly [setup WebDriverAgent](https://appium.io/docs/en/drivers/ios-xcuitest-real-devices/).
-WebDriverAgent project is located under `node_modules/appium-webdriveragent/`.
+##### One-time device setup (real iOS device)
 
-You might want to enable `AssistiveTouch` on your device: `Settings/General/Accessibility`.
+WebDriverAgent has to be built, signed and trusted on the device once:
+
+1. Open the WDA project in Xcode — `WebDriverAgent.xcodeproj` under
+   `.appium-home/node_modules/appium-xcuitest-driver/node_modules/appium-webdriveragent/`
+   (or under `$APPIUM_HOME/…` if you point Appium elsewhere). Select the
+   `WebDriverAgentRunner` scheme, set your **Team** and a unique **Bundle
+   Identifier**, and run it on the device once (`⌘U`).
+2. On the device: **trust** the developer certificate
+   (`Settings → General → VPN & Device Management`) and enable **Developer
+   Mode** (`Settings → Privacy & Security → Developer Mode`, iOS 16+).
+3. (Optional) enable `AssistiveTouch`: `Settings → General → Accessibility`.
+
+See Appium's [real-device configuration guide][wda-real-device] for the full
+WebDriverAgent setup. After this one-time step ws-scrcpy builds and launches WDA
+on its own.
+
+> **Be patient on the first control action.** Appium builds and launches
+> WebDriverAgent on demand, which can take a couple of minutes the first time —
+> the screen may look unresponsive until WDA is up. A free Apple developer
+> account's provisioning expires every 7 days (re-sign weekly); a paid account
+> avoids this.
+
+##### iOS control configuration (environment variables)
+
+| Variable | Purpose |
+| --- | --- |
+| `WDA_TEAM_ID` | Apple Team ID used to sign WebDriverAgent (the certificate's `OU`) |
+| `WDA_SIGNING_ID` | Signing identity (default `Apple Development`) |
+| `WDA_BUNDLE_ID` | Unique WDA bundle id, e.g. `com.<you>.WebDriverAgentRunner` |
+| `WDA_PLATFORM_VERSION` | iOS version of the device (silences a driver warning) |
+| `WDA_USE_PREBUILT` | `true` to reuse an already built/installed WDA (skip the rebuild) |
+| `WS_SCRCPY_DEBUG` | Verbose logs — surfaces the Appium (incl. xcodebuild) and `ws-qvh` output in the server console |
+| `APPIUM_BIN` / `APPIUM_HOME` / `APPIUM_PORT` / `APPIUM_LOG_LEVEL` | Override the bundled Appium binary, driver home, port or log level |
+
+> **`xcodebuild failed with code 65`** almost always means WebDriverAgent could
+> not be **signed or launched** on the device (untrusted certificate, Developer
+> Mode off, wrong Team ID, or expired provisioning) — it is not a build error in
+> ws-scrcpy. Run with `WS_SCRCPY_DEBUG=1` to surface the underlying xcodebuild
+> error and follow the [real-device configuration guide][wda-real-device].
 
 ## Custom Build
 
@@ -202,6 +265,7 @@ web views on android devices
 * `USE_TINY_H264` - include [TinyH264 Player](#tinyh264-player)
 * `USE_WEBCODECS` - include [WebCodecs Player](#webcodecs-player)
 * `USE_WDA_MJPEG_SERVER` - configure WebDriverAgent to start MJPEG server
+_(temporarily suspended, see [MJPEG Server](#mjpeg-server))_
 * `USE_QVH_SERVER` - include support for [ws-qvh][ws-qvh]
 * `SCRCPY_LISTENS_ON_ALL_INTERFACES` - WebSocket server in `scrcpy-server.jar`
 will listen for connections on all available interfaces. When `true`, it allows
@@ -228,6 +292,12 @@ available from the outside. Select `proxy over adb` from the interfaces list.
 * MsePlayer reports too many dropped frames in quality statistics: needs
 further investigation.
 * On Safari file upload does not show progress (it works in one piece).
+* iOS screen casting can be slow to start — if the picture does not appear,
+reload the tab a few times (or replug the device) until the QuickTime stream
+catches; once it does, it stays stable. An empty player does not necessarily
+mean it is broken.
+* iOS control: `xcodebuild failed with code 65` is a WebDriverAgent signing /
+launch issue, not a build error — see [Remote control](#remote-control).
 
 ## Security warning
 Be advised and keep in mind:
@@ -266,6 +336,8 @@ Currently, support of WebSocket protocol added to v1.19 of scrcpy
 [tinyh264]: https://github.com/udevbe/tinyh264
 [node-pty]: https://github.com/Tyriar/node-pty
 [WebDriverAgent]: https://github.com/appium/WebDriverAgent
+[appium]: https://appium.io
+[wda-real-device]: https://appium.github.io/appium-xcuitest-driver/latest/preparation/real-device-config/
 [qvh]: https://github.com/danielpaulus/quicktime_video_hack
 [ws-qvh]: https://github.com/NetrisTV/ws-qvh
 
